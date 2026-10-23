@@ -1,50 +1,92 @@
-# foxyvpn-pool
+# 🦊 foxyvpn-pool
 
-**Per-client Mozilla VPN SOCKS5 exits on top of the `foxyvpn` Python
-client** (vendored in this repository): a small service that gives each of
-your clients its own dedicated exit behind a stable port, driven by an HTTP
-API and a mihomo-compatible subscription endpoint.
-
-`foxyvpn` is the Local SOCKS5 proxy client for the Mozilla VPN / Firefox VPN
-proxy service, published on [PyPI](https://pypi.org/project/foxyvpn/) by
-Vauth (MIT). This repository vendors its `1.0.2` release unchanged and adds
-the pool wrapper; see [Credits](#credits) for the full lineage.
+**One shared token pool, many clients.** `foxyvpn-pool` turns
+[foxyvpn](https://pypi.org/project/foxyvpn/) — the Local SOCKS5 proxy client
+for the Mozilla VPN / Firefox VPN proxy service — from a single-machine,
+single-client tool into a small **multi-client service for your trusted
+network**: every client gets its own dedicated Mozilla VPN exit behind a
+stable port, delivered as 🧾 mihomo subscription nodes and controlled over a
+⚙️ HTTP API.
 
 > Unofficial community software. Not affiliated with or endorsed by Mozilla.
 > Only use it with accounts and a subscription you are authorized to use, in
 > accordance with Mozilla's terms of service.
 
-## What the wrapper does
+## ✨ Highlights
 
-`wrapper/wrapper.py` hands out **one dedicated Mozilla VPN exit per client**.
-A client asks for a node with a name of its own choosing, the wrapper starts
-a `foxyvpn` instance for it, and the client keeps a stable SOCKS5 port for as
-long as it wants.
+- 🖥 **One pool, N clients** — every foxyvpn instance draws from the same
+  pre-provisioned token pool on the host
+- 🚪 **A stable port per client** — public ports come from a monotonic
+  counter persisted in the state DB, so subscription URLs never go stale
+- ♻️ **Dynamic quota refills** — remaining quota is polled from Guardian's
+  `X-Quota-*` headers; an instance whose token set runs dry is moved to a
+  fresh one **without dropping a single client connection**
+- 🌍 **Region switching that nobody notices** — `GET /country?uid=…&country=JP`
+  warms up a replacement instance first; the client's connections keep
+  flowing while the old instance drains
+- 🧾 mihomo subscription endpoint (`/sub?uid=…`) plus plain SOCKS5 for
+  anything else
+- ⚙️ Full instance lifecycle from the API: register, delete, list servers,
+  switch upstream, status
+- 🪝 Zero changes to foxyvpn itself — it is only ever started by the wrapper
+  (the vendored `1.0.2` package stays byte-identical)
+
+## 🤔 Why wrap foxyvpn?
+
+Plain foxyvpn is a **local** client, by design:
+
+| foxyvpn alone | foxyvpn-pool |
+|---|---|
+| One SOCKS5 listener, meant for the machine it runs on | Many clients across a trusted network, each with its own exit |
+| One process = one client consuming its own token pool | One **shared** token pool, dynamically partitioned into per-instance sets as clients come and go |
+| Switching country means restarting the listener — every client connection dies with it | A restart happens **behind** a byte-relay: new connections move to the new instance, existing ones finish on the old one, nobody notices |
+| Quota refills are your problem | The wrapper watches the quota, refills token sets ahead of exhaustion, and puts spent accounts back in the pool |
+
+The key trick that makes the invisible switch possible: SOCKS5 carries
+exactly **one tunnel per TCP connection**, so the relay in front of each
+instance needs to understand no protocol at all — it just moves bytes.
+Every client connection is independent; a swap only affects connections that
+arrive after it.
+
+## 🧠 How it works
 
 ```
-client ──socks5h──> <bind-host>:2000x   front (pure byte relay, no protocol)
+client ──socks5h──> <bind-host>:2000x   🚪 front (pure byte relay, no protocol)
                                            │
-              old instance keeps serving its connections ◄── flip
+              old instance keeps serving its connections ◄── 🔁 flip
                                            │                (drain, then retire)
-                                   127.0.0.1:300xx    foxyvpn backend
+                                   127.0.0.1:300xx    🦊 foxyvpn backend
                                            │
-                              *.fastly-masque.net:2499 ──► exit
+                              *.fastly-masque.net:2499 ──► 🌍 exit
 ```
 
-Because SOCKS5 carries one tunnel per TCP connection, the relay needs to know
-no protocol at all, and **switching a client to a replacement instance is
-invisible**: the replacement is started and warmed up first, the relay is
-pointed at it, and the previous instance is retired only after the connections
-it already carries have drained.
+Every client (a `uid` of its choosing) gets:
 
-Per client the wrapper assigns **5 pool tokens** (configurable in the source)
-and moves it to a fresh set — again invisibly — once even the healthiest
-token in its set drops below 5% of the monthly quota. Quota figures come from
-the `X-Quota-*` headers of Guardian's proxy-pass responses; the pool is
-re-read every poll cycle, so tokens appended to `pool.txt` later are picked
-up automatically.
+- a **public port** (`20000+`, bound to the network address, stable for its
+  lifetime) served by a byte-relay, and
+- an **internal** foxyvpn process (`127.0.0.1:30000+`) holding a private
+  slice of the token pool (5 pool tokens by default).
 
-## Install
+Swapping — a new upstream for a country change, or a fresh token set after
+quota refills — always follows the same choreography: start and warm up the
+replacement → flip the relay → retire the old instance once the connections
+it carries have drained.
+
+## ♻️ The shared token pool
+
+- `pool.txt` holds your pre-provisioned FxA session tokens, one per line.
+  Each account must already have its Mozilla VPN entitlement activated —
+  Guardian refuses (401/403) otherwise.
+- Tokens are re-read every poll cycle, so appending to the file is enough —
+  no restart needed.
+- The wrapper probes Guardian for the remaining quota of every account
+  (bounded to 6 concurrent; the access-token exchange is cached in memory)
+  and moves an instance to a fresh set **before** its current one runs dry.
+  Accounts with quota left return to the pool; empty ones are marked dead.
+- If a backend dies on its own (foxyvpn exits when proxy-pass renewal fails
+  for 120 s), the next poll cycle replaces it — same public port.
+
+## 🚀 Install
 
 ```bash
 git clone https://github.com/anton1615/foxyvpn-pool.git ~/foxyvpn-pool
@@ -52,19 +94,17 @@ python3 -m venv ~/foxyvpn-pool/.venv
 ~/foxyvpn-pool/.venv/bin/pip install ~/foxyvpn-pool
 ```
 
-State (kept outside the checkout):
+Configure the token pool and state (kept outside the checkout):
 
 ```bash
 mkdir -p ~/foxyvpn-data/auth
 cp ~/foxyvpn-pool/wrapper/pool.txt.example ~/foxyvpn-data/pool.txt
-#   ^ fill pool.txt with your pre-provisioned FxA session tokens.
-#     Every account must already have its Mozilla VPN entitlement
-#     activated -- Guardian refuses (401/403) otherwise.
+#   ^ fill pool.txt with your pre-provisioned FxA session tokens
 cp ~/foxyvpn-pool/wrapper/auth.example.json ~/foxyvpn-data/auth/user@example.org.json
 #   ^ optional: uid/email/quota metadata for nicer logs and a warm quota table
 ```
 
-Foreground test run:
+A foreground test run:
 
 ```bash
 ~/foxyvpn-pool/.venv/bin/python ~/foxyvpn-pool/wrapper/wrapper.py \
@@ -72,7 +112,7 @@ Foreground test run:
     --pool-dir ~/foxyvpn-data/pools --db ~/foxyvpn-data/db.sqlite
 ```
 
-As a service (systemd --user):
+As a systemd --user service:
 
 ```bash
 cp ~/foxyvpn-pool/wrapper/foxyvpn-pool.service.example \
@@ -84,23 +124,23 @@ journalctl --user -u foxyvpn-pool -f
 By default the wrapper binds everything to this host's Tailscale address
 (and waits for it to appear at boot). Override with `--bind-host`.
 
-## API
+## ⚙️ HTTP API
 
 Example host below: `100.100.100.101` — replace with your own.
 
 | Endpoint | Meaning |
 |---|---|
-| `GET /register?uid=<name>` | Reserve a client: allocates tokens, starts an instance, returns its stable port. Idempotent for the same name. Optional `&country=JP` or `&proxy=host:2499` |
-| `GET /delete?uid=<name>` | Tear the instance down, release tokens and port |
-| `GET /sub?uid=<name>` | mihomo YAML with that one node |
-| `GET /sub` | mihomo YAML with every node |
-| `GET /list-servers` | Country → upstream `host:port` map (public Firefox Remote Settings data) |
-| `GET /country?uid=<name>&country=JP` | Move the client to another country (invisible to it) |
-| `GET /country?uid=<name>&proxy=host:2499` | Pin an exact upstream (`--proxy`, mutually exclusive with country) |
-| `GET /country?uid=<name>` | Back to the recommended (REC) anycast exit |
-| `GET /status` | Per-client state and pool accounting |
+| `GET /register?uid=<name>` | 🚪 Reserve a client: allocates tokens, starts its instance, returns its stable port. Idempotent for the same name. Optional `&country=JP` or `&proxy=host:2499` |
+| `GET /delete?uid=<name>` | 🗑 Tear the instance down, release tokens and port |
+| `GET /sub?uid=<name>` | 🧾 mihomo YAML with that one node |
+| `GET /sub` | 🧾 mihomo YAML with every node |
+| `GET /list-servers` | 🌍 Country → upstream `host:port` map (public Firefox Remote Settings data) |
+| `GET /country?uid=<name>&country=JP` | 🔁 Move the client to another country, invisibly |
+| `GET /country?uid=<name>&proxy=host:2499` | 🎯 Pin an exact upstream (mutually exclusive with `country`) |
+| `GET /country?uid=<name>` | ↩ Back to the recommended (REC) anycast exit |
+| `GET /status` | 📊 Per-client state and pool accounting |
 
-Register and use:
+Register a client and use it:
 
 ```bash
 curl 'http://100.100.100.101:8080/register?uid=laptop'
@@ -108,7 +148,7 @@ curl 'http://100.100.100.101:8080/register?uid=laptop'
 curl --socks5-hostname 100.100.100.101:20000 https://api.ipify.org
 ```
 
-mihomo subscribers use the subscription URL instead:
+mihomo (and friends) consume the subscription URL instead:
 
 ```
 http://100.100.100.101:8080/sub?uid=laptop
@@ -118,50 +158,45 @@ DNS must resolve on the exit side (`socks5h` semantics): curl uses
 `--socks5-hostname`, Firefox sets `network.proxy.socks_remote_dns=true`,
 mihomo nodes are plain `socks5` type.
 
-## Internal design notes
+## 🛡️ Security & trust model
 
-- Public ports come from a monotonic counter persisted in `db.sqlite`, so a
-  subscription never goes stale; internal foxyvpn ports (loopback only) come
-  from a second counter.
-- foxyvpn is only ever **started**, never modified: the single argv assembly
-  point is `spawn_backend()`, and the control plane simply imports the
-  package's own modules (`foxyvpn.fxa`, `foxyvpn.guardian`,
-  `foxyvpn.serverlist`).
-- A backend that dies on its own (`foxyvpn` exits when proxy-pass renewal
-  fails for 120 s) is replaced on the next poll cycle with the same public
-  port.
-- On startup the wrapper kills sessions it started earlier, re-listens on
-  every recorded public port, and re-launches each instance from the DB.
-- Quota probes are bounded (6 concurrent) and remember each account's
-  access token in memory; Guardian has no observed rate limit but a shared
-  HTTP client chokes under a big burst.
+**Built for a trusted network — a tailnet, a VPN, or a LAN that you
+control.** The SOCKS5 ports and the HTTP API carry **no authentication**,
+and the trust boundary is your network's egress, not this service.
 
-## Security
+Two consequences worth saying out loud:
 
-The SOCKS5 ports and the API carry **no authentication** — the wrapper is
-built for a private network (a tailnet, a VPN, or a LAN you trust). Do not
-expose the bind address to the public internet; egress filtering at the
-network layer is the intended trust boundary. The backend listeners are
-loopback-only; the token files and state DB must stay `0600`.
+- 🎯 The intended usage is that every client **only connects to the node it
+  created with `/register`** — but nothing enforces that mapping. There is
+  no client-to-node protection, so **any client on the network can reach
+  any node the host has created**, use its bandwidth quota, or steer it via
+  the API with a known `uid`.
+- 📡 On a tailnet this is usually acceptable — membership *is* the
+  authorization. On an untrusted LAN it is not: do not expose the bind
+  address to the public internet.
 
-## Layout
+Backend listeners are loopback-only; the token files and the state DB must
+stay `0600`.
+
+## 🧩 Layout
 
 ```
 foxyvpn/            the foxyvpn 1.0.2 package, vendored from the PyPI wheel
 pyproject.toml      build metadata for `pip install .`
 wrapper/
-  wrapper.py                 the pool wrapper (standalone, stdlib only)
-  pool.txt.example           token pool format
-  auth.example.json          optional per-account metadata format
+  wrapper.py                      the pool wrapper (standalone, stdlib only)
+  pool.txt.example                🪙 token pool format
+  auth.example.json               optional per-account metadata format
   foxyvpn-pool.service.example   systemd --user unit
 ```
 
-## Credits
+## 🙏 Credits
 
-- **foxyvpn** Python client — by Vauth, MIT © 2026, [PyPI
-  `foxyvpn`](https://pypi.org/project/foxyvpn/). Vendored here verbatim from
-  the published `1.0.2` wheel (the project's GitHub host currently carries
-  its Android client; the Python source ships as a PyPI artifact only).
+- **foxyvpn** Python client — by Vauth, MIT © 2026,
+  [PyPI `foxyvpn`](https://pypi.org/project/foxyvpn/). Vendored here
+  verbatim from the published `1.0.2` wheel (the project's GitHub host
+  currently carries its Android client; the Python source ships as a PyPI
+  artifact only).
 - foxyvpn describes itself as an independent Python rewrite of
   **[firefox-vpn-client](https://github.com/UjuiUjuMandan/firefox-vpn-client)**
   (Go), whose session-token pool design (`loadSessionTokenPool`,
