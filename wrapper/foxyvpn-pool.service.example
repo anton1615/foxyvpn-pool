@@ -1,0 +1,31 @@
+# systemd --user unit for the foxyvpn pool wrapper.
+# Copy to ~/.config/systemd/user/foxyvpn-pool.service.
+#
+# Paths here assume: the checkout lives at ~/foxyvpn-pool (module venv
+# included), and the mutable state -- pool.txt, auth/, pools/, db.sqlite,
+# never kept inside the checkout -- lives at ~/foxyvpn-data.
+
+[Unit]
+Description=foxyvpn pool wrapper (per-client Mozilla VPN SOCKS5 exits)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/foxyvpn-data
+Environment=PYTHONDONTWRITEBYTECODE=1
+# A stray wrapper process from an earlier run would hold the ports and
+# answer for a stale routing table; clear it before starting.
+ExecStartPre=/bin/sh -c 'pkill -f "wrapper/wrapper[.]py" 2>/dev/null; sleep 1; exit 0'
+ExecStart=%h/foxyvpn-pool/.venv/bin/python %h/foxyvpn-pool/wrapper/wrapper.py \
+    --pool %h/foxyvpn-data/pool.txt \
+    --auth-dir %h/foxyvpn-data/auth \
+    --pool-dir %h/foxyvpn-data/pools \
+    --db %h/foxyvpn-data/db.sqlite
+Restart=always
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

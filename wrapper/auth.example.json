@@ -1,0 +1,11 @@
+{
+  "_about": "Copy into an auth/ directory, one JSON file per account. Whole directory optional -- the wrapper runs from pool.txt alone and only uses these fields to label its quota table and seed it before the first probe. Every other field is ignored, and this directory is never written to.",
+  "session_token": "0000000000000000000000000000000000000000000000000000000000000000",
+  "uid": "account uid",
+  "email": "user@example.org",
+  "quota": {
+    "x-quota-limit": "53687091200",
+    "x-quota-remaining": "53687091200",
+    "x-quota-reset": "2026-11-01T00:00:00.000Z"
+  }
+}

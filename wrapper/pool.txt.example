@@ -1,0 +1,11 @@
+# Copy to pool.txt next to wrapper.py (or pass --pool).
+#
+# One FxA session token (64 hex chars) per line; '#' lines and blank lines
+# are skipped, duplicates are ignored.
+#
+# Every account must already have its Mozilla VPN entitlement activated --
+# Guardian refuses to issue a proxy pass (HTTP 401/403) for an account whose
+# entitlement was never activated. Only use accounts you are authorized to
+# use. The lines below are placeholders.
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000001
