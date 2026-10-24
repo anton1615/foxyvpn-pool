@@ -124,9 +124,35 @@ journalctl --user -u foxyvpn-pool -f
 By default the wrapper binds everything to this host's Tailscale address
 (and waits for it to appear at boot). Override with `--bind-host`.
 
+## 🖥️ Web UI
+
+Set `--ui-token` and the dashboard appears at `/<token>/`. That prefix is an
+alias, not a gate: every API path also answers under it (`/<token>/register`,
+`/<token>/sub`, …), while the bare paths keep working unchanged, so existing
+subscriptions and clients need no edit. There is no login; the token just
+keeps the dashboard off the bare root.
+
+```bash
+~/foxyvpn-pool/.venv/bin/python ~/foxyvpn-pool/wrapper/wrapper.py \
+    --ui-token "$(openssl rand -hex 12)"
+```
+
+The page lists every node with its name, public port, SOCKS5 URL, current
+country/upstream, live connection count and proxy-pass expiry, and offers:
+
+- ➕ create a node (optionally in a country),
+- 🔁 switch a node's country — the public port never changes, existing
+  connections drain in the background,
+- 🗑 delete a node, behind a confirmation dialog.
+
+It refreshes itself every 15 s. Without `--ui-token` nothing changes: the
+API stays on the bare paths and the UI is disabled.
+
 ## ⚙️ HTTP API
 
-Example host below: `100.100.100.101` — replace with your own.
+Example host below: `[IP]` — replace with your own. With `--ui-token TOKEN`
+every path in the table also answers under `/<TOKEN>` (`/status` and
+`/<TOKEN>/status` are the same endpoint); the bare paths are unchanged.
 
 | Endpoint | Meaning |
 |---|---|
@@ -139,6 +165,7 @@ Example host below: `100.100.100.101` — replace with your own.
 | `GET /country?uid=<name>&proxy=host:2499` | 🎯 Pin an exact upstream (mutually exclusive with `country`) |
 | `GET /country?uid=<name>` | ↩ Back to the recommended (REC) anycast exit |
 | `GET /status` | 📊 Per-client state and pool accounting |
+| `GET /ui-state` | 🖥 Everything the dashboard renders: nodes, countries, pool counts |
 
 Register a client and use it:
 
@@ -161,8 +188,10 @@ mihomo nodes are plain `socks5` type.
 ## 🛡️ Security & trust model
 
 **Built for a trusted network — a tailnet, a VPN, or a LAN that you
-control.** The SOCKS5 ports and the HTTP API carry **no authentication**,
-and the trust boundary is your network's egress, not this service.
+control.** The SOCKS5 ports carry no authentication, and neither do the bare
+API paths: the trust boundary is your network's egress, not this service.
+`--ui-token` only keeps the dashboard off the bare root: the same actions
+stay reachable at the bare API paths, so it is a convenience URL, not a gate.
 
 Two consequences worth saying out loud:
 

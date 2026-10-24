@@ -4,6 +4,9 @@
 # Paths here assume: the checkout lives at ~/foxyvpn-pool (module venv
 # included), and the mutable state -- pool.txt, auth/, pools/, db.sqlite,
 # never kept inside the checkout -- lives at ~/foxyvpn-data.
+#
+# Add `--ui-token <secret>` to serve the web UI and the API under /<token>/;
+# leave it out to keep the bare paths and no UI.
 
 [Unit]
 Description=foxyvpn pool wrapper (per-client Mozilla VPN SOCKS5 exits)

@@ -31,6 +31,14 @@ optional `auth/*.json` files hold whatever metadata you keep about them (a
 `session_token` plus any fields you find useful -- `uid`, `email`, `quota`;
 everything else in them is ignored). Both are read again on every poll
 cycle, so tokens added to the pool later are picked up automatically.
+
+Optional web UI
+---------------
+`--ui-token <secret>` serves a dashboard at `/<secret>/`: every node with its
+name, port, country, relays and proxy-pass state, plus create /
+switch-country / delete buttons.  That prefix is an alias for every API path
+too, so the page can use relative URLs; the bare paths keep working, and
+without the flag no UI is served.
 """
 
 from __future__ import annotations
@@ -67,6 +75,337 @@ ROTATE_QUOTA_FRACTION = 0.05      # rotate once even the best token is under 5%
 DRAIN_TIMEOUT = 120.0             # seconds to wait for the old backend to drain
 PROBE_CONCURRENCY = 6
 BACKEND_READY_TIMEOUT = 30.0
+RESERVED_PATHS = {"register", "delete", "sub", "list-servers", "status",
+                  "country", "ui-state", "favicon.ico"}
+
+
+# ── web UI ──────────────────────────────────────────────────────────────────
+#
+# Served at /<ui-token>/.  The page only talks to the same origin with
+# relative URLs, so it works under whatever token prefix was configured; all
+# user-supplied text (uids) goes in through textContent, never innerHTML.
+
+UI_HTML = """<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>foxyvpn 節點</title>
+<style>
+:root{
+  --bg:#0f1115; --fg:#e8eaf0; --muted:#8b93a7; --line:#232838; --card:#161a24;
+  --accent:#4da3ff; --ok:#3ecf8e; --warn:#d8a93b; --err:#e5544b;
+}
+@media (prefers-color-scheme:light){
+  :root{--bg:#f5f6fa;--fg:#161a22;--muted:#5d6577;--line:#e1e4ec;--card:#fff;
+        --accent:#1f6feb;--ok:#17945c;--warn:#96690b;--err:#c0342c}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:14px/1.5 system-ui,-apple-system,"Segoe UI","Noto Sans TC",sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+       justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--line)}
+h1{margin:0;font-size:18px;font-weight:650}
+.sub{color:var(--muted);font-size:12px}
+#chips{display:flex;flex-wrap:wrap;gap:8px;padding:14px 22px 0}
+.chip{border:1px solid var(--line);background:var(--card);border-radius:999px;
+      padding:3px 11px;font-size:12px;color:var(--muted)}
+.chip b{color:var(--fg);font-weight:600;margin-left:4px}
+main{padding:14px 22px 48px}
+#list{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+      padding:14px 16px;display:flex;flex-direction:column;gap:8px}
+.card-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.uid{font-weight:650;font-size:15px;overflow-wrap:anywhere}
+.badge{font-size:11px;padding:2px 8px;border-radius:999px;
+       border:1px solid currentColor;white-space:nowrap}
+.badge.ok{color:var(--ok)} .badge.warn{color:var(--warn)} .badge.err{color:var(--err)}
+.row{display:flex;gap:10px;align-items:baseline;font-size:13px}
+.row .k{color:var(--muted);flex:0 0 74px}
+.row .v{overflow-wrap:anywhere}
+code,.mono{font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+button{font:inherit;border-radius:8px;border:1px solid var(--line);
+       background:transparent;color:var(--fg);padding:6px 12px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{filter:brightness(1.08);color:#fff}
+button.danger{color:var(--err);border-color:var(--err)}
+button.danger:hover{background:var(--err);color:#fff}
+button.link{padding:0;border:0;background:none;color:var(--accent);text-align:left}
+button.link:hover{text-decoration:underline}
+button[disabled]{opacity:.5;cursor:default}
+.card-actions{display:flex;gap:8px;margin-top:4px}
+.empty{color:var(--muted);padding:28px;text-align:center;
+       border:1px dashed var(--line);border-radius:12px}
+dialog{border:1px solid var(--line);border-radius:14px;background:var(--card);
+       color:var(--fg);padding:18px 20px;width:min(430px,92vw)}
+dialog::backdrop{background:rgba(0,0,0,.5)}
+dialog h2{margin:0 0 10px;font-size:15px}
+dialog p{margin:0 0 14px;color:var(--muted);overflow-wrap:anywhere}
+dialog label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px}
+dialog input,dialog select{width:100%;padding:8px 10px;border-radius:8px;
+       border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
+.dlg-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
+       background:var(--card);border:1px solid var(--line);border-radius:10px;
+       padding:9px 14px;font-size:13px;box-shadow:0 8px 26px rgba(0,0,0,.25);
+       opacity:0;pointer-events:none;transition:opacity .18s;max-width:90vw}
+#toast.show{opacity:1}
+#toast.err{color:var(--err);border-color:var(--err)}
+#busy{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;
+      place-items:center;z-index:20}
+#busy.show{display:grid}
+#busy span{background:var(--card);border:1px solid var(--line);border-radius:12px;
+           padding:14px 20px;font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>foxyvpn 節點</h1><div class="sub" id="hostline"></div></div>
+  <div style="display:flex;gap:8px">
+    <button id="refresh">重新整理</button>
+    <button id="add" class="primary">新增節點</button>
+  </div>
+</header>
+<div id="chips"></div>
+<main><div id="list"></div></main>
+<div id="busy"><span id="busytext">處理中…</span></div>
+<div id="toast"></div>
+
+<dialog id="dlg-add">
+  <h2>新增節點</h2>
+  <label for="add-uid">名稱 (uid)</label>
+  <input id="add-uid" placeholder="例如 laptop" autocomplete="off" spellcheck="false">
+  <label for="add-country">國家</label>
+  <select id="add-country"></select>
+  <div class="dlg-actions">
+    <button data-close>取消</button>
+    <button class="primary" id="add-ok">建立</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-country">
+  <h2>切換國家</h2>
+  <p id="cc-who"></p>
+  <label for="cc-sel">國家</label>
+  <select id="cc-sel"></select>
+  <div class="dlg-actions">
+    <button data-close>取消</button>
+    <button class="primary" id="cc-ok">切換</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-del">
+  <h2>刪除節點</h2>
+  <p id="del-who"></p>
+  <div class="dlg-actions">
+    <button data-close>取消</button>
+    <button class="danger" id="del-ok">確定刪除</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+const BASE = location.pathname.slice(-1) === "/" ? location.pathname : location.pathname + "/";
+let S = null, target = null, toastTimer = 0;
+const $ = s => document.querySelector(s);
+
+function el(tag, props, ...kids) {
+  const n = document.createElement(tag);
+  if (props) for (const k in props) {
+    const v = props[k];
+    if (v == null) continue;
+    if (k === "class") n.className = v;
+    else if (k === "onclick") n.addEventListener("click", v);
+    else n[k] = v;
+  }
+  for (const kid of kids) if (kid != null && kid !== false) {
+    n.append(kid.nodeType ? kid : String(kid));
+  }
+  return n;
+}
+
+async function api(action, params) {
+  const u = new URL(BASE + action, location.href);
+  for (const k in (params || {})) if (params[k] != null) u.searchParams.set(k, params[k]);
+  const r = await fetch(u, {cache: "no-store"});
+  const t = await r.text();
+  if (!r.ok) throw new Error(t.trim() || ("HTTP " + r.status));
+  try { return JSON.parse(t); } catch { return t; }
+}
+
+function toast(msg, err) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show" + (err ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ""; }, 4200);
+}
+
+function busy(on, text) {
+  $("#busytext").textContent = text || "處理中…";
+  $("#busy").classList.toggle("show", !!on);
+}
+
+function fmtDur(sec) {
+  if (sec == null || isNaN(sec)) return "—";
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  if (h) return h + "h" + String(m).padStart(2, "0") + "m";
+  if (m) return m + "m" + String(s).padStart(2, "0") + "s";
+  return s + "s";
+}
+
+function countryLabel(i) {
+  if (i.upstream) return "自訂 " + i.upstream;
+  if (!i.country) return "自動 (REC)";
+  const name = S.countries[i.country];
+  return name ? name + " (" + i.country + ")" : i.country;
+}
+
+function fillCountries(sel) {
+  sel.textContent = "";
+  sel.append(el("option", {value: ""}, "自動 (REC)"));
+  const codes = Object.keys(S.countries || {})
+    .sort((a, b) => S.countries[a].localeCompare(S.countries[b]));
+  for (const code of codes) {
+    sel.append(el("option", {value: code}, S.countries[code] + " (" + code + ")"));
+  }
+}
+
+async function copy(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("已複製 " + text);
+  } catch { toast(text); }
+}
+
+function card(i) {
+  const socks = "socks5://" + (S.host || location.hostname) + ":" + i.port;
+  const state = !i.backend_alive ? ["err", "後端離線"]
+    : i.accepting === false ? ["warn", "暫停接受：" + (i.reason || "draining")]
+    : ["ok", "運作中"];
+  const row = (k, v) => el("div", {class: "row"},
+    el("span", {class: "k"}, k), el("span", {class: "v"}, v));
+  return el("div", {class: "card"},
+    el("div", {class: "card-top"},
+      el("div", {class: "uid"}, i.uid),
+      el("span", {class: "badge " + state[0]}, state[1])),
+    row("端口", el("code", null, String(i.port))),
+    row("連線", el("button", {
+      class: "link mono", title: "點擊複製", onclick: () => copy(socks)}, socks)),
+    row("國家", countryLabel(i)),
+    row("帳號", i.accounts + " 個"),
+    row("連線數", String(i.relays || 0)),
+    row("Proxy pass", i.seconds_until_expiry == null
+      ? "—" : fmtDur(i.seconds_until_expiry) + " 後到期"),
+    el("div", {class: "card-actions"},
+      el("button", {onclick: () => openCountry(i)}, "切換國家"),
+      el("button", {class: "danger", onclick: () => openDelete(i)}, "刪除")));
+}
+
+function render() {
+  $("#hostline").textContent = (S.host || location.hostname) + " · 每 15 秒自動更新";
+  const chips = $("#chips");
+  chips.textContent = "";
+  const chip = (label, value) => chips.append(
+    el("span", {class: "chip"}, label, el("b", null, String(value))));
+  chip("節點", S.instances.length);
+  chip("帳號空閒", S.accounts.free);
+  chip("已分配", S.accounts.assigned);
+  chip("失效", S.accounts.dead);
+  const list = $("#list");
+  list.textContent = "";
+  if (!S.instances.length) {
+    list.append(el("div", {class: "empty"}, "目前沒有節點。按右上角「新增節點」建立一個。"));
+    return;
+  }
+  for (const i of S.instances) list.append(card(i));
+}
+
+async function refresh() {
+  try {
+    S = await api("ui-state");
+    render();
+  } catch (e) {
+    toast("載入失敗：" + e.message, true);
+  }
+}
+
+function openCountry(i) {
+  target = i;
+  $("#cc-who").textContent =
+    i.uid + "：公開端口 " + i.port + " 不變，既有連線會在背景 drain 後才斷。";
+  fillCountries($("#cc-sel"));
+  $("#cc-sel").value = i.country || "";
+  $("#dlg-country").showModal();
+}
+
+function openDelete(i) {
+  target = i;
+  $("#del-who").textContent =
+    "確定要刪除「" + i.uid + "」？會停止它的 foxyvpn、釋放帳號與端口 " +
+    i.port + "，無法復原。";
+  $("#dlg-del").showModal();
+}
+
+$("#refresh").onclick = refresh;
+$("#add").onclick = () => {
+  $("#add-uid").value = "";
+  fillCountries($("#add-country"));
+  $("#dlg-add").showModal();
+  setTimeout(() => $("#add-uid").focus(), 30);
+};
+document.querySelectorAll("[data-close]").forEach(b => {
+  b.onclick = () => b.closest("dialog").close();
+});
+
+$("#add-ok").onclick = async () => {
+  const uid = $("#add-uid").value.trim();
+  if (!uid) { toast("請填節點名稱", true); return; }
+  const country = $("#add-country").value;
+  $("#dlg-add").close();
+  busy(true, "正在建立「" + uid + "」…");
+  try {
+    await api("register", {uid, country});
+    toast("已建立 " + uid);
+  } catch (e) { toast("建立失敗：" + e.message, true); }
+  finally { busy(false); refresh(); }
+};
+
+$("#cc-ok").onclick = async () => {
+  if (!target) return;
+  const uid = target.uid, country = $("#cc-sel").value;
+  $("#dlg-country").close();
+  busy(true, "切換「" + uid + "」到 " + (country || "自動") + "…");
+  try {
+    await api("country", {uid, country});
+    toast(uid + " 已切換到 " + (country || "自動"));
+  } catch (e) { toast("切換失敗：" + e.message, true); }
+  finally { busy(false); refresh(); }
+};
+
+$("#del-ok").onclick = async () => {
+  if (!target) return;
+  const uid = target.uid;
+  $("#dlg-del").close();
+  busy(true, "刪除「" + uid + "」…");
+  try {
+    await api("delete", {uid});
+    toast("已刪除 " + uid);
+  } catch (e) { toast("刪除失敗：" + e.message, true); }
+  finally { busy(false); refresh(); }
+};
+
+refresh();
+setInterval(() => {
+  if (!document.querySelector("dialog[open]")) refresh();
+}, 15000);
+</script>
+</body>
+</html>
+"""
 
 
 def log(msg: str) -> None:
@@ -333,6 +672,7 @@ class Wrapper:
         self._access_tokens: dict[str, tuple[str, float]] = {}
         self._quota_lock = asyncio.Lock()
         self._rotate_lock = asyncio.Lock()
+        self._servers: tuple[float, dict] | None = None
 
     # -- account supply ---------------------------------------------------
 
@@ -716,7 +1056,22 @@ class Wrapper:
     # -- HTTP ---------------------------------------------------------------
 
     async def handle(self, path: str, query: dict[str, list[str]]) -> tuple[int, str, str]:
+        token = self.args.ui_token
+        via_token = False
+        if token:
+            root = "/" + token
+            if path.startswith(root + "/"):
+                path = path[len(root):]
+                via_token = True
         one = {k: v[0] for k, v in query.items() if v}
+        if path == "/":
+            # The UI lives only under the token; the bare root stays unused so
+            # existing clients keep their paths.
+            if not via_token:
+                return 404, "text/plain", "not found\n"
+            return 200, "text/html; charset=utf-8", UI_HTML
+        if path == "/ui-state":
+            return 200, "application/json", json.dumps(await self.ui_state(), indent=2)
         if path == "/register":
             uid = one.get("uid", "").strip()
             if not uid:
@@ -788,11 +1143,21 @@ class Wrapper:
         lines += ["rules:", "  - MATCH,foxyvpn"]
         return "\n".join(lines) + "\n"
 
-    def server_list(self) -> dict:
+    def server_list(self, max_age: float = 600.0) -> dict:
+        """Country → upstream map.  Cached: the UI asks on every refresh."""
         from foxyvpn import serverlist
 
+        now = time.time()
+        if self._servers and now - self._servers[0] < max_age:
+            return self._servers[1]
+        try:
+            countries = serverlist.fetch_server_list()
+        except Exception:
+            if self._servers:
+                return self._servers[1]
+            raise
         out: dict[str, Any] = {}
-        for country in serverlist.fetch_server_list():
+        for country in countries:
             servers = []
             for city in country.cities:
                 for server in city.servers:
@@ -800,6 +1165,7 @@ class Wrapper:
                                     "city": city.code,
                                     "quarantined": server.quarantined})
             out[country.code] = {"name": country.name, "servers": servers}
+        self._servers = (now, out)
         return out
 
     def status(self) -> dict:
@@ -815,6 +1181,44 @@ class Wrapper:
             },
         }
 
+    async def ui_state(self) -> dict:
+        """Everything the web UI renders, in one round trip."""
+        try:
+            countries = await asyncio.to_thread(self.server_list)
+        except Exception as exc:  # noqa: BLE001
+            # Remote Settings down: the page still works, the country picker
+            # just falls back to "auto".
+            log(f"server list unavailable for the ui: {exc}")
+            countries = {}
+        insts = []
+        for inst in self.instances.values():
+            item = self._instance_json(inst)
+            item["relays"] = inst.front.total_relays() if inst.front is not None else 0
+            status = self._status_file(inst)
+            item["accepting"] = status.get("accepting")
+            item["reason"] = status.get("reason")
+            item["seconds_until_expiry"] = status.get("seconds_until_expiry")
+            insts.append(item)
+        accounts = self.store.accounts()
+        return {
+            "host": self.args.bind_host,
+            "instances": insts,
+            "countries": {code: info["name"] for code, info in countries.items()},
+            "accounts": {
+                "free": sum(1 for a in accounts if a.state == "free"),
+                "assigned": sum(1 for a in accounts if a.state == "assigned"),
+                "dead": sum(1 for a in accounts if a.state == "dead"),
+            },
+        }
+
+    def _status_file(self, inst: Instance) -> dict:
+        path = os.path.join(self.args.pool_dir, safe_name(inst.uid) + ".status.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
 
 # ── HTTP plumbing ───────────────────────────────────────────────────────────
 
@@ -825,17 +1229,26 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         log("http " + (fmt % args))
 
-    def _respond(self, code: int, ctype: str, body: str) -> None:
+    def _respond(self, code: int, ctype: str, body: str,
+                 headers: dict[str, str] | None = None) -> None:
         payload = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(payload)
 
     def _dispatch(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        token = self.wrapper.args.ui_token
+        if token and parsed.path == "/" + token:
+            # A trailing slash keeps the page's relative URLs inside the token.
+            self._respond(302, "text/plain", "", {"Location": "/" + token + "/"})
+            return
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self.wrapper.handle(parsed.path, query), self.wrapper.loop)
@@ -906,7 +1319,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--api-port", type=int, default=8080)
     ap.add_argument("--poll-interval", type=float, default=600.0,
                     help="seconds between quota polls")
+    ap.add_argument("--ui-token", default="",
+                    help="serve the web UI and the whole API under /<token>/; "
+                         "the token is the only credential (empty: UI disabled)")
     args = ap.parse_args(argv)
+    if args.ui_token and (not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.ui_token)
+                          or args.ui_token in RESERVED_PATHS):
+        print("--ui-token must be 1-64 chars of [A-Za-z0-9_-] and not an API path name",
+              file=sys.stderr)
+        return 2
     if args.bind_host is None:
         # After a boot the wrapper can start before tailscaled has come up.
         # Waiting a little is better than binding the wrong address, and
@@ -940,6 +1361,10 @@ def main(argv: list[str] | None = None) -> int:
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log(f"api on http://{args.bind_host}:{args.api_port}")
+    if args.ui_token:
+        log(f"web ui on http://{args.bind_host}:{args.api_port}/{args.ui_token}/")
+    else:
+        log("web ui disabled (no --ui-token)")
 
     async def run() -> None:
         await wrapper.start()
