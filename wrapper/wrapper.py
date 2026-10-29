@@ -517,7 +517,8 @@ class Store:
                           quota_reset: str) -> None:
         self.db.execute(
             "UPDATE accounts SET quota_max=?, quota_left=?, quota_reset=?,"
-            " state=CASE WHEN ?<=0 THEN 'dead' ELSE state END WHERE token=?",
+            # a successful probe with quota left proves the account is alive, even if it was marked dead earlier
+            " state=CASE WHEN ?<=0 THEN 'dead' WHEN state='dead' THEN 'free' ELSE state END WHERE token=?",
             (quota_max, quota_left, quota_reset, quota_left, token))
         self.db.commit()
 
