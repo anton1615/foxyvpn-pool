@@ -73,6 +73,8 @@ INTERNAL_PORT_BASE = 30000
 TOKENS_PER_INSTANCE = 5
 ROTATE_QUOTA_FRACTION = 0.05      # rotate once even the best token is under 5%
 DRAIN_TIMEOUT = 120.0             # seconds to wait for the old backend to drain
+KILL_RESP_GRACE = float(os.environ.get("KILL_RESP_GRACE", 15))   # rotate 後,上游已回完的閒置連線靜默幾秒就斬
+KILL_REQ_GRACE = float(os.environ.get("KILL_REQ_GRACE", 30))     # 請求已送、等首位元組的連線保留至少此秒數
 PROBE_CONCURRENCY = 6
 BACKEND_READY_TIMEOUT = 30.0
 RESERVED_PATHS = {"register", "delete", "sub", "list-servers", "status",
@@ -568,7 +570,7 @@ class Front:
         self.port = port
         self.backend: tuple[str, int] | None = None
         self._server: asyncio.AbstractServer | None = None
-        self._relays: dict[int, tuple[str, int]] = {}
+        self._relays: dict[int, dict] = {}   # relay_id -> {backend, last, from_client, writers}
         self._next_id = 0
 
     async def start(self) -> None:
@@ -585,10 +587,33 @@ class Front:
         self.backend = backend
 
     def relay_count(self, backend: tuple[str, int]) -> int:
-        return sum(1 for v in self._relays.values() if v == backend)
+        return sum(1 for r in self._relays.values() if r["backend"] == backend)
 
     def total_relays(self) -> int:
         return len(self._relays)
+
+    def kill_idle(self, backend: tuple[str, int], grace_req: float, grace_resp: float) -> int:
+        """Close conns on `backend` silent longer than their grace; return how many.
+
+        from_client=True means the last bytes went client→upstream (request
+        sent, awaiting the first byte) → long grace. False means
+        upstream→client (response finished, the typical idle keep-alive pool
+        conn) → short grace. A byte relay cannot tell those apart with
+        certainty, hence two graces.
+        """
+        now = time.monotonic()
+        killed = 0
+        for r in list(self._relays.values()):
+            if r["backend"] != backend:
+                continue
+            grace = grace_req if r["from_client"] else grace_resp
+            if now - r["last"] < grace:
+                continue
+            killed += 1
+            for w in r["writers"]:
+                with contextlib.suppress(Exception):
+                    w.close()
+        return killed
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         backend = self.backend
@@ -609,9 +634,12 @@ class Front:
             return
         self._next_id += 1
         relay_id = self._next_id
-        self._relays[relay_id] = backend
+        entry = {"backend": backend, "last": time.monotonic(), "from_client": True,
+                 "writers": (writer, bw)}
+        self._relays[relay_id] = entry
         try:
-            await asyncio.gather(self._pipe(reader, bw), self._pipe(br, writer),
+            await asyncio.gather(self._pipe(reader, bw, entry, True),
+                                 self._pipe(br, writer, entry, False),
                                  return_exceptions=True)
         finally:
             self._relays.pop(relay_id, None)
@@ -620,7 +648,8 @@ class Front:
                     w.close()
 
     @staticmethod
-    async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                    entry: dict, from_client: bool) -> None:
         try:
             while True:
                 data = await reader.read(65536)
@@ -628,6 +657,8 @@ class Front:
                     break
                 writer.write(data)
                 await writer.drain()
+                entry["last"] = time.monotonic()
+                entry["from_client"] = from_client
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
         finally:
@@ -856,15 +887,24 @@ class Wrapper:
         return False
 
     async def retire_backend(self, inst: Instance, backend: Backend | None) -> None:
-        """Wait for the old backend's connections to drain, then stop it."""
+        """Wait for the old backend's connections to drain, then stop it.
+
+        Idle conns left on the retired backend are shut after their grace so
+        the client's next request has to dial again and lands on the new
+        backend (new exit IP) instead of riding the old one for up to
+        DRAIN_TIMEOUT. Conns still moving bytes keep it alive until done.
+        """
         if backend is None:
             return
+        target = ("127.0.0.1", backend.port)
         deadline = time.monotonic() + DRAIN_TIMEOUT
         while time.monotonic() < deadline:
             if backend.proc.poll() is not None:
                 break
-            if inst.front is not None and inst.front.relay_count(("127.0.0.1", backend.port)) == 0:
-                break
+            if inst.front is not None:
+                if inst.front.relay_count(target) == 0:
+                    break
+                inst.front.kill_idle(target, KILL_REQ_GRACE, KILL_RESP_GRACE)
             await asyncio.sleep(1.0)
         backend.stop()
 
