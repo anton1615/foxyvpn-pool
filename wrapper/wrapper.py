@@ -593,22 +593,26 @@ class Front:
         return len(self._relays)
 
     def kill_idle(self, backend: tuple[str, int], grace_req: float, grace_resp: float) -> int:
-        """Close conns on `backend` silent longer than their grace; return how many.
+        """Close conns on `backend` idle past their grace; return how many.
 
-        from_client=True means the last bytes went client→upstream (request
-        sent, awaiting the first byte) → long grace. False means
-        upstream→client (response finished, the typical idle keep-alive pool
-        conn) → short grace. A byte relay cannot tell those apart with
-        certainty, hence two graces.
+        Each direction is timed separately:
+          last_up   last byte upstream→client (response / streamed tokens)
+          last_down last byte client→upstream (request)
+        An idle pooled conn is silent both ways -> cut after grace_resp so the
+        next request re-dials onto the new backend. A live stream keeps
+        last_up fresh (measured max inter-token gap: 6s) -> never cut. A
+        request still waiting for its first byte keeps last_down fresh ->
+        protected for grace_req.
         """
         now = time.monotonic()
         killed = 0
         for r in list(self._relays.values()):
             if r["backend"] != backend:
                 continue
-            grace = grace_req if r["from_client"] else grace_resp
-            if now - r["last"] < grace:
-                continue
+            if now - r["last_down"] < grace_req:
+                continue          # client spoke recently: may be awaiting a reply
+            if now - r["last_up"] < grace_resp:
+                continue          # upstream still streaming: leave it alone
             killed += 1
             for w in r["writers"]:
                 with contextlib.suppress(Exception):
@@ -634,12 +638,12 @@ class Front:
             return
         self._next_id += 1
         relay_id = self._next_id
-        entry = {"backend": backend, "last": time.monotonic(), "from_client": True,
-                 "writers": (writer, bw)}
+        entry = {"backend": backend, "last_up": time.monotonic(),
+                 "last_down": time.monotonic(), "writers": (writer, bw)}
         self._relays[relay_id] = entry
         try:
-            await asyncio.gather(self._pipe(reader, bw, entry, True),
-                                 self._pipe(br, writer, entry, False),
+            await asyncio.gather(self._pipe(reader, bw, entry, False),
+                                 self._pipe(br, writer, entry, True),
                                  return_exceptions=True)
         finally:
             self._relays.pop(relay_id, None)
@@ -649,7 +653,7 @@ class Front:
 
     @staticmethod
     async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                    entry: dict, from_client: bool) -> None:
+                    entry: dict, upstream: bool) -> None:
         try:
             while True:
                 data = await reader.read(65536)
@@ -657,8 +661,7 @@ class Front:
                     break
                 writer.write(data)
                 await writer.drain()
-                entry["last"] = time.monotonic()
-                entry["from_client"] = from_client
+                entry["last_up" if upstream else "last_down"] = time.monotonic()
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
         finally:
