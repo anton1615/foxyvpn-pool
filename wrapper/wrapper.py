@@ -51,7 +51,8 @@ import json
 import os
 import re
 import signal
-import sqlite3
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -557,6 +558,103 @@ class Store:
 
 # ── TCP relay ───────────────────────────────────────────────────────────────
 
+async def _socks5_dial(br, bw, host: str, port: int) -> bool:
+    """對 backend(foxyvpn SOCKS5)做 CONNECT。True=br/bw 可傳目標資料。"""
+    try:
+        bw.write(b"\x05\x01\x00")
+        await bw.drain()
+        r = await asyncio.wait_for(br.readexactly(2), timeout=25)
+        if r[0] != 5:
+            return False
+        hb = host.encode()
+        if len(hb) > 255:
+            return False
+        bw.write(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack("!H", port))
+        await bw.drain()
+        r2 = await asyncio.wait_for(br.readexactly(10), timeout=25)
+        return r2[1] == 0
+    except Exception:
+        return False
+
+
+async def _http_bridge(reader, writer, br, bw) -> bool:
+    """front 一洞雙協議:socks5 或 HTTP CONNECT 都收。
+
+    偷看第一個 byte:
+      0x05        → SOCKS5:front 自己完成交握(後端只收 _socks5_dial 之後的資料)
+      "CONNECT.." → 對後端 socks5-dial,回 200
+      其他        → 405 斷線
+    True=交握完成,caller 接手雙向 pipe;False=連線已收。
+    """
+    async def drop():
+        writer.close()
+        bw.close()
+        return False
+    try:
+        first = await asyncio.wait_for(reader.readexactly(1), timeout=60)
+    except Exception:
+        return await drop()
+    if first == b"\x05":
+        try:
+            nm = (await reader.readexactly(1))[0]
+            await reader.readexactly(nm)
+            writer.write(b"\x05\x00"); await writer.drain()
+            req = await reader.readexactly(4)
+            if req[1] != 1:
+                raise ValueError("connect only")
+            atyp = req[3]
+            if atyp == 1:
+                host = socket.inet_ntoa(await reader.readexactly(4))
+            elif atyp == 3:
+                n = (await reader.readexactly(1))[0]
+                host = (await reader.readexactly(n)).decode("utf-8", "replace")
+            else:
+                await reader.readexactly(16)
+                host = "127.0.0.1"
+            port = struct.unpack("!H", await reader.readexactly(2))[0]
+            if not await _socks5_dial(br, bw, host, port):
+                writer.write(b"\x05\x05\x00\x01" + b"\x00" * 6)
+                with contextlib.suppress(Exception):
+                    await writer.drain()
+                raise ValueError("inner refused")
+            writer.write(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+            await writer.drain()
+        except Exception:
+            return await drop()
+    elif first in (b"C", b"c"):
+        try:
+            buf = first
+            while b"\r\n\r\n" not in buf:
+                more = await asyncio.wait_for(reader.read(4096), timeout=60)
+                if not more:
+                    raise ValueError("truncated")
+                buf += more
+            req_line = buf.split(b"\r\n", 1)[0].decode("latin1")
+            parts = req_line.split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                raise ValueError("not CONNECT")
+            host, _, port_s = parts[1].rpartition(":")
+            if not await _socks5_dial(br, bw, host, int(port_s)):
+                raise ValueError("inner refused")
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+            idx = buf.find(b"\r\n\r\n")
+            left = buf[idx + 4:] if idx >= 0 else b""
+            if left:
+                bw.write(left); await bw.drain()
+        except Exception:
+            with contextlib.suppress(Exception):
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+            return await drop()
+    else:
+        with contextlib.suppress(Exception):
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+        return await drop()
+    return True
+
+
 class Front:
     """A stable public port that relays to the current backend.
 
@@ -638,6 +736,8 @@ class Front:
             return
         self._next_id += 1
         relay_id = self._next_id
+        if not await _http_bridge(reader, writer, br, bw):
+            return                    # 交握失敗:連線已在 bridge 裡收掉
         entry = {"backend": backend, "last_up": time.monotonic(),
                  "last_down": time.monotonic(), "writers": (writer, bw)}
         self._relays[relay_id] = entry
