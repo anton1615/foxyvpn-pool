@@ -17,12 +17,13 @@ Each client gets two ports:
                    points at it never goes stale.
   internal 30000+  foxyvpn's own SOCKS5 listener, bound to 127.0.0.1.
 
-A small TCP relay sits in front of the internal port.  It speaks no
-protocol at all -- it just moves bytes -- because SOCKS5 carries one tunnel
-per TCP connection, so each client connection is independent of every other
-one.  That is what makes a swap invisible: a replacement foxyvpn is started
-and warmed up, the relay is pointed at it, and the previous instance is
-retired only once the connections it already carries have drained.
+A small TCP relay sits in front of the internal port.  It terminates the
+client handshake — SOCKS5 or HTTP CONNECT — and then moves bytes, because
+SOCKS5 carries one tunnel per TCP connection, so each client connection is
+independent of every other one.  That is what makes a swap invisible: a
+replacement foxyvpn is started and warmed up, the relay is pointed at it, and
+the previous instance is retired only once the connections it already carries
+have drained.
 
 Account supply
 --------------
@@ -52,6 +53,7 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -559,7 +561,6 @@ class Store:
 # ── TCP relay ───────────────────────────────────────────────────────────────
 
 async def _socks5_dial(br, bw, host: str, port: int) -> bool:
-    """對 backend(foxyvpn SOCKS5)做 CONNECT。True=br/bw 可傳目標資料。"""
     try:
         bw.write(b"\x05\x01\x00")
         await bw.drain()
@@ -577,29 +578,28 @@ async def _socks5_dial(br, bw, host: str, port: int) -> bool:
         return False
 
 
-async def _http_bridge(reader, writer, br, bw) -> bool:
-    """front 一洞雙協議:socks5 或 HTTP CONNECT 都收。
-
-    偷看第一個 byte:
-      0x05        → SOCKS5:front 自己完成交握(後端只收 _socks5_dial 之後的資料)
-      "CONNECT.." → 對後端 socks5-dial,回 200
-      其他        → 405 斷線
-    True=交握完成,caller 接手雙向 pipe;False=連線已收。
-    """
-    async def drop():
-        writer.close()
-        bw.close()
+async def _http_bridge(reader, writer, br, bw, entry=None) -> bool:
+    def drop():
+        for w in (writer, bw):
+            with contextlib.suppress(Exception):
+                w.close()
         return False
+    def touch(upstream):
+        if entry is not None:
+            entry["last_up" if upstream else "last_down"] = time.monotonic()
     try:
         first = await asyncio.wait_for(reader.readexactly(1), timeout=60)
+        touch(False)
     except Exception:
-        return await drop()
+        return drop()
     if first == b"\x05":
         try:
-            nm = (await reader.readexactly(1))[0]
-            await reader.readexactly(nm)
+            nm = (await asyncio.wait_for(reader.readexactly(1), timeout=60))[0]
+            await asyncio.wait_for(reader.readexactly(nm), timeout=60)
+            touch(False)
             writer.write(b"\x05\x00"); await writer.drain()
-            req = await reader.readexactly(4)
+            req = await asyncio.wait_for(reader.readexactly(4), timeout=60)
+            touch(False)
             if req[1] != 1:
                 raise ValueError("connect only")
             atyp = req[3]
@@ -609,8 +609,7 @@ async def _http_bridge(reader, writer, br, bw) -> bool:
                 n = (await reader.readexactly(1))[0]
                 host = (await reader.readexactly(n)).decode("utf-8", "replace")
             else:
-                await reader.readexactly(16)
-                host = "127.0.0.1"
+                host = socket.inet_ntop(socket.AF_INET6, await reader.readexactly(16))
             port = struct.unpack("!H", await reader.readexactly(2))[0]
             if not await _socks5_dial(br, bw, host, port):
                 writer.write(b"\x05\x05\x00\x01" + b"\x00" * 6)
@@ -620,47 +619,53 @@ async def _http_bridge(reader, writer, br, bw) -> bool:
             writer.write(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
             await writer.drain()
         except Exception:
-            return await drop()
+            return drop()
     elif first in (b"C", b"c"):
         try:
             buf = first
+            deadline = time.monotonic() + 60     # 交握的總期限,不只 per-read
             while b"\r\n\r\n" not in buf:
+                if len(buf) > 32768:
+                    raise ValueError("headers too large")
+                if time.monotonic() > deadline:
+                    raise ValueError("handshake timeout")
                 more = await asyncio.wait_for(reader.read(4096), timeout=60)
                 if not more:
                     raise ValueError("truncated")
                 buf += more
+            touch(False)
             req_line = buf.split(b"\r\n", 1)[0].decode("latin1")
             parts = req_line.split()
             if len(parts) < 2 or parts[0].upper() != "CONNECT":
                 raise ValueError("not CONNECT")
             host, _, port_s = parts[1].rpartition(":")
+            host = host.strip("[]")     # CONNECT [::1]:443
             if not await _socks5_dial(br, bw, host, int(port_s)):
                 raise ValueError("inner refused")
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
-            idx = buf.find(b"\r\n\r\n")
-            left = buf[idx + 4:] if idx >= 0 else b""
+            left = buf.split(b"\r\n\r\n", 1)[1]
             if left:
                 bw.write(left); await bw.drain()
         except Exception:
             with contextlib.suppress(Exception):
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 await writer.drain()
-            return await drop()
+            return drop()
     else:
         with contextlib.suppress(Exception):
             writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
-        return await drop()
+        return drop()
     return True
 
 
 class Front:
     """A stable public port that relays to the current backend.
 
-    It moves bytes and knows nothing about SOCKS5.  Each accepted
-    connection is bound to the backend that was current when it arrived, so
-    retiring a backend does not disturb the connections it already carries.
+    Each accepted connection is bound to the backend that was current when it
+    arrived, so retiring a backend does not disturb the connections it
+    already carries.
     """
 
     def __init__(self, host: str, port: int):
@@ -668,7 +673,7 @@ class Front:
         self.port = port
         self.backend: tuple[str, int] | None = None
         self._server: asyncio.AbstractServer | None = None
-        self._relays: dict[int, dict] = {}   # relay_id -> {backend, last, from_client, writers}
+        self._relays: dict[int, dict] = {}
         self._next_id = 0
 
     async def start(self) -> None:
@@ -693,26 +698,27 @@ class Front:
     def kill_idle(self, backend: tuple[str, int], grace_req: float, grace_resp: float) -> int:
         """Close conns on `backend` idle past their grace; return how many.
 
-        Each direction is timed separately:
-          last_up   last byte upstream→client (response / streamed tokens)
-          last_down last byte client→upstream (request)
-        An idle pooled conn is silent both ways -> cut after grace_resp so the
-        next request re-dials onto the new backend. A live stream keeps
-        last_up fresh (measured max inter-token gap: 6s) -> never cut. A
-        request still waiting for its first byte keeps last_down fresh ->
-        protected for grace_req.
+        last_up is the last upstream→client byte (response / streamed tokens),
+        last_down the last client→upstream byte (request). An idle pooled conn
+        is silent both ways, so it is cut after grace_resp and the next request
+        re-dials onto the new backend. A request still waiting for its first
+        byte keeps last_down fresh and is protected for grace_req.
         """
         now = time.monotonic()
         killed = 0
         for r in list(self._relays.values()):
             if r["backend"] != backend:
                 continue
-            if now - r["last_down"] < grace_req:
-                continue          # client spoke recently: may be awaiting a reply
-            if now - r["last_up"] < grace_resp:
-                continue          # upstream still streaming: leave it alone
+            req_idle = now - r["last_down"]
+            resp_idle = now - r["last_up"]
+            if req_idle < grace_req:
+                continue
+            if resp_idle < grace_resp:
+                continue
             killed += 1
             for w in r["writers"]:
+                if w is None:
+                    continue          # 還在 dial 的連線:沒有 socket 可關
                 with contextlib.suppress(Exception):
                     w.close()
         return killed
@@ -722,6 +728,13 @@ class Front:
         if backend is None:
             writer.close()
             return
+        self._next_id += 1
+        relay_id = self._next_id
+        # 先登記再 dial:dial 期間的連線也必須被 retire 的 relay_count 看見,
+        # 否則剛好被換掉的 backend 會在 dial 完成前就被停掉。
+        entry = {"backend": backend, "last_up": time.monotonic(),
+                 "last_down": time.monotonic(), "writers": (writer, None)}
+        self._relays[relay_id] = entry
         br = bw = None
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
@@ -732,15 +745,13 @@ class Front:
             except (OSError, asyncio.TimeoutError):
                 await asyncio.sleep(0.3)
         if br is None or bw is None:
+            self._relays.pop(relay_id, None)
             writer.close()
             return
-        self._next_id += 1
-        relay_id = self._next_id
-        if not await _http_bridge(reader, writer, br, bw):
-            return                    # 交握失敗:連線已在 bridge 裡收掉
-        entry = {"backend": backend, "last_up": time.monotonic(),
-                 "last_down": time.monotonic(), "writers": (writer, bw)}
-        self._relays[relay_id] = entry
+        entry["writers"] = (writer, bw)
+        if not await _http_bridge(reader, writer, br, bw, entry):
+            self._relays.pop(relay_id, None)
+            return
         try:
             await asyncio.gather(self._pipe(reader, bw, entry, False),
                                  self._pipe(br, writer, entry, True),
@@ -759,9 +770,11 @@ class Front:
                 data = await reader.read(65536)
                 if not data:
                     break
+                # 先打戳再 drain:對方讀得慢時 drain 會阻塞,那時連線是活的
+                # 不該被當成閒置。
+                entry["last_up" if upstream else "last_down"] = time.monotonic()
                 writer.write(data)
                 await writer.drain()
-                entry["last_up" if upstream else "last_down"] = time.monotonic()
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
         finally:
@@ -1001,13 +1014,20 @@ class Wrapper:
             return
         target = ("127.0.0.1", backend.port)
         deadline = time.monotonic() + DRAIN_TIMEOUT
-        while time.monotonic() < deadline:
+        hard_deadline = deadline + DRAIN_TIMEOUT   # 最多再多給一輪給還在動的串流
+        while True:
             if backend.proc.poll() is not None:
                 break
-            if inst.front is not None:
-                if inst.front.relay_count(target) == 0:
-                    break
-                inst.front.kill_idle(target, KILL_REQ_GRACE, KILL_RESP_GRACE)
+            if inst.front is None or inst.front.relay_count(target) == 0:
+                break
+            inst.front.kill_idle(target, KILL_REQ_GRACE, KILL_RESP_GRACE)
+            now = time.monotonic()
+            if now >= hard_deadline:
+                break
+            if now >= deadline:
+                # 還有連線在動就延長一輪,而不是硬殺:活串流被斬掉等於回到
+                # 「rotate 會中斷回覆」的老問題。
+                deadline = now + DRAIN_TIMEOUT
             await asyncio.sleep(1.0)
         backend.stop()
 
@@ -1436,7 +1456,6 @@ def detect_bind_host() -> str | None:
         pass
 
     # Tailscale hands out addresses in 100.64.0.0/10.
-    import socket
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             octets = info[4][0].split(".")
