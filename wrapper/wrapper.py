@@ -594,11 +594,11 @@ async def _http_bridge(reader, writer, br, bw, entry=None) -> bool:
         return drop()
     if first == b"\x05":
         try:
-            nm = (await reader.readexactly(1))[0]
-            await reader.readexactly(nm)
+            nm = (await asyncio.wait_for(reader.readexactly(1), timeout=60))[0]
+            await asyncio.wait_for(reader.readexactly(nm), timeout=60)
             touch(False)
             writer.write(b"\x05\x00"); await writer.drain()
-            req = await reader.readexactly(4)
+            req = await asyncio.wait_for(reader.readexactly(4), timeout=60)
             touch(False)
             if req[1] != 1:
                 raise ValueError("connect only")
@@ -623,9 +623,12 @@ async def _http_bridge(reader, writer, br, bw, entry=None) -> bool:
     elif first in (b"C", b"c"):
         try:
             buf = first
+            deadline = time.monotonic() + 60     # 交握的總期限,不只 per-read
             while b"\r\n\r\n" not in buf:
                 if len(buf) > 32768:
                     raise ValueError("headers too large")
+                if time.monotonic() > deadline:
+                    raise ValueError("handshake timeout")
                 more = await asyncio.wait_for(reader.read(4096), timeout=60)
                 if not more:
                     raise ValueError("truncated")
@@ -714,6 +717,8 @@ class Front:
                 continue
             killed += 1
             for w in r["writers"]:
+                if w is None:
+                    continue          # 還在 dial 的連線:沒有 socket 可關
                 with contextlib.suppress(Exception):
                     w.close()
         return killed
@@ -723,6 +728,13 @@ class Front:
         if backend is None:
             writer.close()
             return
+        self._next_id += 1
+        relay_id = self._next_id
+        # 先登記再 dial:dial 期間的連線也必須被 retire 的 relay_count 看見,
+        # 否則剛好被換掉的 backend 會在 dial 完成前就被停掉。
+        entry = {"backend": backend, "last_up": time.monotonic(),
+                 "last_down": time.monotonic(), "writers": (writer, None)}
+        self._relays[relay_id] = entry
         br = bw = None
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
@@ -733,13 +745,10 @@ class Front:
             except (OSError, asyncio.TimeoutError):
                 await asyncio.sleep(0.3)
         if br is None or bw is None:
+            self._relays.pop(relay_id, None)
             writer.close()
             return
-        self._next_id += 1
-        relay_id = self._next_id
-        entry = {"backend": backend, "last_up": time.monotonic(),
-                 "last_down": time.monotonic(), "writers": (writer, bw)}
-        self._relays[relay_id] = entry
+        entry["writers"] = (writer, bw)
         if not await _http_bridge(reader, writer, br, bw, entry):
             self._relays.pop(relay_id, None)
             return
@@ -761,9 +770,11 @@ class Front:
                 data = await reader.read(65536)
                 if not data:
                     break
+                # 先打戳再 drain:對方讀得慢時 drain 會阻塞,那時連線是活的
+                # 不該被當成閒置。
+                entry["last_up" if upstream else "last_down"] = time.monotonic()
                 writer.write(data)
                 await writer.drain()
-                entry["last_up" if upstream else "last_down"] = time.monotonic()
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
         finally:
@@ -1003,13 +1014,20 @@ class Wrapper:
             return
         target = ("127.0.0.1", backend.port)
         deadline = time.monotonic() + DRAIN_TIMEOUT
-        while time.monotonic() < deadline:
+        hard_deadline = deadline + DRAIN_TIMEOUT   # 最多再多給一輪給還在動的串流
+        while True:
             if backend.proc.poll() is not None:
                 break
-            if inst.front is not None:
-                if inst.front.relay_count(target) == 0:
-                    break
-                inst.front.kill_idle(target, KILL_REQ_GRACE, KILL_RESP_GRACE)
+            if inst.front is None or inst.front.relay_count(target) == 0:
+                break
+            inst.front.kill_idle(target, KILL_REQ_GRACE, KILL_RESP_GRACE)
+            now = time.monotonic()
+            if now >= hard_deadline:
+                break
+            if now >= deadline:
+                # 還有連線在動就延長一輪,而不是硬殺:活串流被斬掉等於回到
+                # 「rotate 會中斷回覆」的老問題。
+                deadline = now + DRAIN_TIMEOUT
             await asyncio.sleep(1.0)
         backend.stop()
 
