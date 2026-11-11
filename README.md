@@ -43,15 +43,19 @@ Plain foxyvpn is a **local** client, by design:
 | Quota refills are your problem | The wrapper watches the quota, refills token sets ahead of exhaustion, and puts spent accounts back in the pool |
 
 The key trick that makes the invisible switch possible: SOCKS5 carries
-exactly **one tunnel per TCP connection**, so the relay in front of each
-instance needs to understand no protocol at all — it just moves bytes.
-Every client connection is independent; a swap only affects connections that
-arrive after it.
+exactly **one tunnel per TCP connection**, so every client connection is
+independent; a swap only affects connections that arrive after it.
+
+The front accepts **both SOCKS5 and HTTP proxy (`CONNECT`) clients** on the
+same port, so a client that speaks HTTP proxy does not need its own
+socks5→http converter. It sniffs the first byte, terminates that handshake
+itself, and dials the inner SOCKS5 backend on the client's behalf; after the
+handshake it only moves bytes.
 
 ## 🧠 How it works
 
 ```
-client ──socks5h──> <bind-host>:2000x   🚪 front (pure byte relay, no protocol)
+client ──socks5h / HTTP CONNECT──> <bind-host>:2000x   🚪 front (terminates the handshake)
                                            │
               old instance keeps serving its connections ◄── 🔁 flip
                                            │                (drain, then retire)
