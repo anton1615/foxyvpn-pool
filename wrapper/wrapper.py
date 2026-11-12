@@ -69,7 +69,9 @@ DEFAULT_POOL = os.path.join(HERE, "pool.txt")
 DEFAULT_AUTH_DIR = os.path.join(HERE, "auth")
 DEFAULT_POOL_DIR = os.path.join(HERE, "pools")
 DEFAULT_DB = os.path.join(HERE, "db.sqlite")
-FOXYVPN_BIN = os.path.join(os.path.dirname(HERE), ".venv", "bin", "foxyvpn")
+# Deployments differ on where the venv sits; FOXYVPN_BIN wins when set.
+FOXYVPN_BIN = (os.environ.get("FOXYVPN_BIN", "").strip()
+               or os.path.join(os.path.dirname(HERE), ".venv", "bin", "foxyvpn"))
 
 PUBLIC_PORT_BASE = 20000
 INTERNAL_PORT_BASE = 30000
