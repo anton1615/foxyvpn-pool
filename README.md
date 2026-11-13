@@ -1,5 +1,10 @@
 # 🦊 foxyvpn-pool
 
+> ⚠️ **Deprecated** — this standalone repo is now part of
+> [anton1615/proxy-pool-collection](https://github.com/anton1615/proxy-pool-collection).
+> New work targets the collection repository; this one is kept for historical
+> reference and will not receive further updates.
+
 **One shared token pool, many clients.** `foxyvpn-pool` turns
 [foxyvpn](https://pypi.org/project/foxyvpn/) — the Local SOCKS5 proxy client
 for the Mozilla VPN / Firefox VPN proxy service — from a single-machine,
